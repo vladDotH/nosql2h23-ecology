@@ -1,0 +1,397 @@
+--- # mongo deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: mongo
+  name: mongo
+  namespace: ecology
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mongo
+  template:
+    metadata:
+      labels:
+        app: mongo
+    spec:
+      containers:
+        - image: mongo:7.0.4
+          imagePullPolicy: IfNotPresent
+          name: mongo
+          args: ["--dbpath", "/data/db"]
+
+--- # mongo service
+apiVersion: v1
+kind: Service
+metadata:
+  namespace: ecology
+  name: mongo
+  labels:
+    app: mongo
+spec:
+  ports:
+    - port: 27017
+      targetPort: 27017
+  clusterIP: None
+  selector:
+    app: mongo
+
+--- # redis deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  labels:
+    app: redis
+  namespace: ecology
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+        - name: redis
+          imagePullPolicy: IfNotPresent
+          image: redis:alpine3.19
+
+--- # redis service
+apiVersion: v1
+kind: Service
+metadata:
+  namespace: ecology
+  name: redis
+  labels:
+    app: redis
+spec:
+  ports:
+    - port: 6379
+      targetPort: 6379
+  clusterIP: None
+  selector:
+    app: redis
+
+--- # server deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: server
+  namespace: ecology
+  labels:
+    app: server-deployment
+spec:
+  selector:
+    matchLabels:
+      app: server
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: server
+    spec:
+      containers:
+      - image: vladdoth/ecology:server
+        imagePullPolicy: IfNotPresent
+        name: server
+        command: ["gunicorn"]
+        args: ["-k", "geventwebsocket.gunicorn.workers.GeventWebSocketWorker", "-w", "1", "--bind", "0.0.0.0:80", "run:app"]
+        env:
+        - name: MONGO_URI
+          value: "mongodb://mongo:27017/db"
+        - name: REDIS_URI
+          value: "redis://redis:6379/0"
+        ports:
+        - containerPort: 80
+          name: server
+
+--- # server service
+apiVersion: v1
+kind: Service
+metadata:
+  name: server-service
+  labels:
+    app: server-service
+  namespace: ecology
+spec:
+  ports:
+  - port: 80
+    protocol: TCP
+    targetPort: 80
+  selector:
+    app: server
+  type: NodePort
+
+--- # slicer worker deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: slice-worker-deployment
+  namespace: ecology
+  labels:
+    app: worker-deployment
+    queue: slice
+spec:
+  selector:
+    matchLabels:
+      app: worker
+      queue: slice
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: worker
+        queue: slice
+    spec:
+      containers:
+      - image: vladdoth/ecology:worker
+        imagePullPolicy: IfNotPresent
+        name: worker
+        command: ["celery"]
+        args: ["-A", "app", "worker", "-Q", "slice", "--loglevel=ERROR", "-c", "1"]
+        resources:
+          requests:
+            memory: "600Mi"
+          limits:
+            memory: "600Mi"
+        env:
+        - name: MONGO_URI
+          value: "mongodb://mongo:27017/db"
+        - name: REDIS_URI
+          value: "redis://redis:6379/0"
+        - name: MAX_ZOOM
+          value: "17"
+
+--- # image processing worker deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: image-worker-deployment
+  namespace: ecology
+  labels:
+    app: worker-deployment
+    queue: image
+spec:
+  selector:
+    matchLabels:
+      app: worker
+      queue: image
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: worker
+        queue: image
+    spec:
+      containers:
+      - image: vladdoth/ecology:worker
+        imagePullPolicy: IfNotPresent
+        name: worker
+        command: ["celery"]
+        args: ["-A", "app", "worker", "-Q", "image_process,dev", "--loglevel=ERROR", "-c", "1"]
+        resources:
+          requests:
+            memory: "800Mi"
+          limits:
+            memory: "800Mi"
+        env:
+        - name: MONGO_URI
+          value: "mongodb://mongo:27017/db"
+        - name: REDIS_URI
+          value: "redis://redis:6379/0"
+
+--- # client deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: ecology
+  labels:
+    app: frontend-deployment
+spec:
+  selector:
+    matchLabels:
+      app: frontend
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: frontend
+    spec:
+      containers:
+      - image: vladdoth/ecology:frontend
+        imagePullPolicy: IfNotPresent
+        name: frontend
+
+--- # client service
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend-service
+  labels:
+    app: frontend-service
+  namespace: ecology
+spec:
+  ports:
+  - port: 80
+    protocol: TCP
+    targetPort: 80
+  selector:
+    app: frontend
+  type: NodePort
+
+--- # ingress
+# apiVersion: networking.k8s.io/v1
+# kind: Ingress
+# metadata:
+#   name: ingress
+#   labels:
+#    app: ingress
+#   namespace: ecology
+# spec:
+#   rules:
+#   - host: "cluster.vladdoth.xyz"
+#     http:
+#       paths:
+#       - path: /ecology/api
+#         pathType: Prefix  
+#         backend:
+#           service:
+#             name: server-service
+#             port:
+#               number: 80
+#       - path: /ecology
+#         pathType: Prefix  
+#         backend:
+#           service:
+#             name: frontend-service
+#             port:
+#               number: 80
+
+--- # balancer
+apiVersion: v1
+kind: Service
+metadata:
+  name: balancer
+  namespace: ecology
+spec:
+  selector:
+    app: nginx
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 80
+  type: LoadBalancer
+
+--- # reverse-proxy nginx conf
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nginx-conf
+  namespace: ecology
+data:
+  nginx.conf: |
+    user nginx;
+    worker_processes 1;
+
+    error_log /var/log/nginx/error.log notice;
+    pid /var/run/nginx.pid;
+
+    events {
+        worker_connections  1024;
+    }
+
+    http {
+        include       /etc/nginx/mime.types;
+        default_type application/octet-stream;
+
+        log_format main '$remote_addr - $remote_user [$time_local] "$request" '
+                          '$status $body_bytes_sent "$http_referer" '
+                          '"$http_user_agent" "$http_x_forwarded_for"';
+
+        access_log /var/log/nginx/access.log main;
+
+        sendfile on;
+        #tcp_nopush on;
+
+        keepalive_timeout 65;
+
+        #gzip  on;
+
+        upstream app-client {
+            server frontend-service:80;
+        }
+
+        upstream app-server {
+            server server-service:80;
+        }
+
+        server {
+            listen 80;
+
+            location /ecology/api {
+                proxy_pass         http://app-server;
+                proxy_redirect     off;
+                proxy_set_header   Host $host;
+                proxy_set_header   X-Real-IP $remote_addr;
+                proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+                proxy_set_header   X-Forwarded-Host $server_name;
+            }
+
+            location /ecology {
+                proxy_pass         http://app-client;
+                proxy_redirect     off;
+                proxy_set_header   Host $host;
+                proxy_set_header   X-Real-IP $remote_addr;
+                proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+                proxy_set_header   X-Forwarded-Host $server_name;
+            }
+        }
+
+        client_max_body_size 20M;
+    }
+
+--- # nginx deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx
+  namespace: ecology
+  labels:
+    app: nginx-deployment
+spec:
+  selector:
+    matchLabels:
+      app: nginx
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: nginx
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.27.2-alpine3.20-slim
+        ports:
+        - containerPort: 80
+        volumeMounts:
+          - name: nginx-conf
+            mountPath: /etc/nginx/nginx.conf
+            subPath: nginx.conf
+      volumes:
+      - name: nginx-conf
+        configMap:
+          name: nginx-conf
+          items:
+            - key: nginx.conf
+              path: nginx.conf
+
